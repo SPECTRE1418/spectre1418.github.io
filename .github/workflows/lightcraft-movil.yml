@@ -1,0 +1,285 @@
+name: LightCraft Movil (web + PWA + APK)
+
+# Compila LightCraft (version web oficial, WebAssembly), la publica en GitHub Pages
+# como app instalable (PWA) y genera un APK de Android. Todo en la nube de GitHub.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/lightcraft-movil.yml']
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: lightcraft-movil
+  cancel-in-progress: true
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Descargar LightCraft (codigo oficial)
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/lightcraft
+          path: upstream
+
+      - name: Descargar fuentes (craft-fonts)
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/craft-fonts
+          path: craft-fonts
+
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache de compilacion
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: upstream
+
+      - name: Preparar toolchain y wasm-bindgen
+        working-directory: upstream
+        run: |
+          rustup target add wasm32-unknown-unknown
+          V=$(awk '/^name = "wasm-bindgen"$/{getline; print; exit}' Cargo.lock | cut -d'"' -f2)
+          echo "wasm-bindgen $V"
+          cargo install wasm-bindgen-cli --version "$V" --locked
+
+      - name: Compilar version web
+        working-directory: upstream
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+        run: cargo xtask web
+
+      - name: Armar sitio PWA
+        run: |
+          WORKER=$(find upstream/target -maxdepth 4 -name worker.js | head -n1)
+          test -n "$WORKER" || { echo "No se encontro la salida web"; exit 1; }
+          rm -rf site
+          cp -r "$(dirname "$WORKER")" site
+          find site -name '*.gz' -delete
+          find site -name '*.br' -delete
+
+          # Iconos
+          ICON=$(find upstream/assets/app-icon -name '*.png' -printf '%s %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2-)
+          echo "Icono base: $ICON"
+          convert "$ICON" -resize 192x192 site/icon-192.png || cp "$ICON" site/icon-192.png
+          convert "$ICON" -resize 512x512 site/icon-512.png || cp "$ICON" site/icon-512.png
+          cp site/icon-512.png icon-apk.png
+
+          cat > site/manifest.webmanifest <<'EOF'
+          {
+            "name": "LightCraft",
+            "short_name": "LightCraft",
+            "description": "Biblioteca de fotos y revelado RAW",
+            "start_url": "./",
+            "scope": "./",
+            "display": "standalone",
+            "orientation": "any",
+            "background_color": "#1b1b1b",
+            "theme_color": "#1b1b1b",
+            "icons": [
+              { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+              { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+            ]
+          }
+          EOF
+
+          cat > site/sw.js <<'EOF'
+          const C = 'lightcraft-movil-v1';
+          self.addEventListener('install', () => self.skipWaiting());
+          self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+          self.addEventListener('fetch', e => {
+            if (e.request.method !== 'GET') return;
+            e.respondWith(
+              fetch(e.request).then(r => {
+                if (r.ok && r.status === 200) {
+                  const copy = r.clone();
+                  caches.open(C).then(c => c.put(e.request, copy)).catch(() => {});
+                }
+                return r;
+              }).catch(() => caches.match(e.request))
+            );
+          });
+          EOF
+
+          python3 - <<'PY'
+          p = 'site/index.html'
+          s = open(p, encoding='utf-8').read()
+          head = '<link rel="manifest" href="manifest.webmanifest"><meta name="theme-color" content="#1b1b1b"><link rel="icon" href="icon-192.png">'
+          if 'viewport' not in s:
+              head = '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">' + head
+          sw = "<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('sw.js').catch(function(){});});}</script>"
+          if '</head>' in s:
+              s = s.replace('</head>', head + '</head>', 1)
+          else:
+              s = head + s
+          if '</body>' in s:
+              s = s.replace('</body>', sw + '</body>', 1)
+          else:
+              s += sw
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+
+          echo "--- Contenido del sitio ---"
+          ls -la site
+          grep -nE '(src|href)="/[^/]' site/index.html || true
+
+      - name: Guardar icono para el APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: icono-apk
+          path: icon-apk.png
+
+      - name: Subir sitio a Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: web
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.dep.outputs.page_url }}
+    steps:
+      - name: Publicar en GitHub Pages
+        id: dep
+        uses: actions/deploy-pages@v4
+
+  apk:
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: icono-apk
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Crear proyecto Android (TWA)
+        run: |
+          OWNER=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          REPO="${GITHUB_REPOSITORY#*/}"
+          REPO_LC=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
+          if [ "$REPO_LC" = "$OWNER.github.io" ]; then
+            URL="https://$OWNER.github.io/"
+          else
+            URL="https://$OWNER.github.io/$REPO/"
+          fi
+          echo "URL de la app: $URL"
+
+          mkdir -p twa/app/src/main/res/mipmap-xxxhdpi
+          cd twa
+          cp ../icon-apk.png app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+            repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+            repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "LightCraftMovil"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+            id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+            id 'com.android.application'
+          }
+          android {
+            namespace 'app.lightcraft.movil'
+            compileSdk 34
+            defaultConfig {
+              applicationId 'app.lightcraft.movil'
+              minSdk 24
+              targetSdk 34
+              versionCode 1
+              versionName '1.0'
+            }
+            compileOptions {
+              sourceCompatibility JavaVersion.VERSION_17
+              targetCompatibility JavaVersion.VERSION_17
+            }
+          }
+          dependencies {
+            implementation 'com.google.androidbrowserhelper:androidbrowserhelper:2.5.0'
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET" />
+            <application
+                android:label="LightCraft"
+                android:icon="@mipmap/ic_launcher"
+                android:allowBackup="true"
+                android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+              <activity
+                  android:name="com.google.androidbrowserhelper.trusted.LauncherActivity"
+                  android:exported="true">
+                <meta-data
+                    android:name="android.support.customtabs.trusted.DEFAULT_URL"
+                    android:value="__URL__" />
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          sed -i "s|__URL__|$URL|" app/src/main/AndroidManifest.xml
+
+      - name: Compilar APK
+        working-directory: twa
+        run: gradle --no-daemon assembleDebug
+
+      - name: Renombrar APK
+        run: cp twa/app/build/outputs/apk/debug/app-debug.apk LightCraft.apk
+
+      - name: Guardar APK como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: LightCraft-APK
+          path: LightCraft.apk
+
+      - name: Publicar APK en Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: LightCraft APK ${{ github.run_number }}
+          body: |
+            APK de LightCraft para Android. Descarga `LightCraft.apk` e instalalo
+            (permite "instalar apps desconocidas" para tu navegador si lo pide).
+          files: LightCraft.apk
+          
